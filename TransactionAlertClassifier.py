@@ -1,9 +1,15 @@
-"""
-2025玉山人工智慧挑戰賽範例程式碼
-"""
 import os
 import pandas as pd
 from sklearn.tree import DecisionTreeClassifier
+from preprocessing import preprocess
+import matplotlib.pyplot as plt
+from sklearn.tree import plot_tree
+from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
+from sklearn.tree import DecisionTreeClassifier, export_text
+from sklearn.metrics import f1_score
+
+from typing import Tuple
+import numpy as np
 
 
 def LoadCSV(dir_path):
@@ -13,9 +19,9 @@ def LoadCSV(dir_path):
         dir_path (str): 資料夾，請把上述3個檔案放在同一個資料夾
     
     Returns:
-        df_txn: 交易資料 DataFrame
-        df_alert: 警示帳戶註記 DataFrame
-        df_test: 待預測帳戶清單 DataFrame
+        df_txn    : 交易資料 DataFrame
+        df_alert  : 警示帳戶註記 DataFrame
+        df_test   : 待預測帳戶清單 DataFrame
     """
     df_txn = pd.read_csv(os.path.join(dir_path, 'acct_transaction.csv'))
     df_alert = pd.read_csv(os.path.join(dir_path, 'acct_alert.csv'))
@@ -26,33 +32,13 @@ def LoadCSV(dir_path):
 
 
 def PreProcessing(df):
-    """
-    資料處理的範例程式，計算每個帳戶的一些統計量，當作模型因子
-    參賽者可自行發想、設計自己的因子
-    """    
-    # 1. 'total_send/recv_amt': total amount sent/received by each acct
-    send = df.groupby('from_acct')['txn_amt'].sum().rename('total_send_amt')
-    recv = df.groupby('to_acct')['txn_amt'].sum().rename('total_recv_amt')
-
-    # 2. max, min, avg txn_amt for each account
-    max_send = df.groupby('from_acct')['txn_amt'].max().rename('max_send_amt')
-    min_send = df.groupby('from_acct')['txn_amt'].min().rename('min_send_amt')
-    avg_send = df.groupby('from_acct')['txn_amt'].mean().rename('avg_send_amt')
+    # 檢查欄位是否存在，做一些前置安全檢查
+    required = {'from_acct', 'to_acct', 'txn_amt', 'from_acct_type', 'to_acct_type'}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Transaction CSV missing columns: {missing}")
     
-    max_recv = df.groupby('to_acct')['txn_amt'].max().rename('max_recv_amt')
-    min_recv = df.groupby('to_acct')['txn_amt'].min().rename('min_recv_amt')
-    avg_recv = df.groupby('to_acct')['txn_amt'].mean().rename('avg_recv_amt')
-
-    df_result = pd.concat([max_send, min_send, avg_send, max_recv, min_recv, avg_recv, send, recv], axis=1).fillna(0).reset_index()
-    df_result.rename(columns={'index': 'acct'}, inplace=True)
-    
-    # 2. 'is_esun': is esun account or not
-    df_from = df[['from_acct', 'from_acct_type']].rename(columns={'from_acct': 'acct', 'from_acct_type': 'is_esun'})
-    df_to = df[['to_acct', 'to_acct_type']].rename(columns={'to_acct': 'acct', 'to_acct_type': 'is_esun'})
-    df_acc = pd.concat([df_from, df_to], ignore_index=True).drop_duplicates().reset_index(drop=True)
-    
-    # 4. merge (1), (2), and (3)
-    df_result = pd.merge(df_result, df_acc, on='acct', how='left')    
+    df_result = preprocess(df) 
     print("(Finish) PreProcessing.")
     return df_result
 
@@ -72,21 +58,89 @@ def TrainTestSplit(df, df_alert, df_test):
     print(f"(Finish) Train-Test-Split")
     return X_train, X_test, y_train
 
-def Modeling(X_train, y_train, X_test):
-    """
-    Decision Tree的範例程式，參賽者可以在這裡實作自己需要的方法
-    """
-    model = DecisionTreeClassifier(random_state=42)
-    model.fit(X_train.drop(columns=['acct']), y_train)
-    y_pred = model.predict(X_test.drop(columns=['acct']))   
-    
-    print(f"(Finish) Modeling")
-    return y_pred
+# def Modeling(X_train, y_train, X_test):
+#     """
+#     Decision Tree的範例程式，參賽者可以在這裡實作自己需要的方法
+#     """
+#     model = DecisionTreeClassifier(random_state=42, max_depth=4)
+#     model.fit(X_train.drop(columns=['acct']), y_train)
+#     y_pred = model.predict(X_test.drop(columns=['acct']))  
 
-def OutputCSV(path, df_test, X_test, y_pred):
+    
+#     print(f"(Finish) Modeling")
+#     return y_pred
+
+
+def Modeling(X_train: pd.DataFrame, y_train: pd.Series, X_test: pd.DataFrame
+            ) -> Tuple[np.ndarray, DecisionTreeClassifier]:
+    """
+    1) 以訓練資料再切出 validation，做 F1 驗證
+    2) 用 GridSearchCV 尋找最佳超參數（以 F1 為 scoring）
+    3) 印出最佳參數與 validation F1
+    4) 用最佳模型對 X_test 預測
+    5) 視覺化：畫一棵「淺樹」與輸出文字規則
+    返回: (y_pred_test, best_model)
+    """
+
+    # -----------------------------
+    # A. 準備資料（去掉 ID 欄位）
+    # -----------------------------
+    feat_cols = [c for c in X_train.columns if c != "acct"]
+    X_tr = X_train[feat_cols].copy()
+    X_te = X_test[feat_cols].copy()
+
+    # 先切一個 validation 來評估 F1
+    X_tr_in, X_val, y_tr_in, y_val = train_test_split(
+        X_tr, y_train, test_size=0.2, random_state=42, stratify=y_train
+    )
+
+    # -----------------------------
+    # B. GridSearchCV（以 F1 為指標）
+    # -----------------------------
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    param_grid = {
+        "max_depth": [3, 4, 5, 6, 8, None],
+        "min_samples_split": [2, 20, 50, 100, 200],
+        "min_samples_leaf": [1, 10, 20, 50],
+        "class_weight": [None, "balanced"],
+        # "criterion": ["gini", "entropy", "log_loss"],
+    }
+
+    grid = GridSearchCV(
+        DecisionTreeClassifier(random_state=42),
+        param_grid=param_grid,
+        scoring="f1",   # 以 F1 挑最佳
+        cv=cv,
+        n_jobs=-1,
+        verbose=1,
+    )
+    grid.fit(X_tr_in, y_tr_in)
+
+    best_model: DecisionTreeClassifier = grid.best_estimator_
+    # 用 validation 看真實 F1（不是 CV 的平均）
+    y_val_pred = best_model.predict(X_val)
+    val_f1 = f1_score(y_val, y_val_pred)
+
+    print("\n[GridSearch] Best CV F1:", grid.best_score_)
+    print("[GridSearch] Best params:", grid.best_params_)
+    print("[Holdout]   Validation F1:", val_f1)
+
+    # -----------------------------
+    # C. 用最佳模型對 X_test 預測
+    # -----------------------------
+    y_pred_test = best_model.predict(X_te)
+
+    print("(Finish) Modeling with GridSearchCV + F1 evaluation + Visualization")
+    return y_pred_test
+
+def OutputCSV(path, df_test, X_test, y_pred, df_alert):
     """
     根據測試資料集及預測結果，產出預測結果之CSV，該CSV可直接上傳於TBrain    
     """
+    print("len(X_test) =", len(X_test))
+    print("len(X_test['acct']) =", len(X_test['acct']))
+    print("len(y_pred) =", len(y_pred))
+
     df_pred = pd.DataFrame({
         'acct': X_test['acct'].values,
         'label': y_pred
@@ -94,15 +148,14 @@ def OutputCSV(path, df_test, X_test, y_pred):
     
     df_out = df_test[['acct']].merge(df_pred, on='acct', how='left')
     df_out.to_csv(path, index=False)    
-    
     print(f"(Finish) Output saved to {path}")
 
 if __name__ == "__main__":
-    dir_path = "../preliminary_data/"
+    dir_path = "./preliminary_data/"
     df_txn, df_alert, df_test = LoadCSV(dir_path)
     df_X = PreProcessing(df_txn)
     X_train, X_test, y_train = TrainTestSplit(df_X, df_alert, df_test)
     y_pred = Modeling(X_train, y_train, X_test)
     out_path = "result.csv"
-    OutputCSV(out_path, df_test, X_test, y_pred)   
+    OutputCSV(out_path, df_test, X_test, y_pred, df_alert)   
     
