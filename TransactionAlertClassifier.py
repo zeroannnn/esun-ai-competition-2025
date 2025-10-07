@@ -78,13 +78,10 @@ def Modeling(X_train: pd.DataFrame, y_train: pd.Series, X_test: pd.DataFrame
     2) 用 GridSearchCV 尋找最佳超參數（以 F1 為 scoring）
     3) 印出最佳參數與 validation F1
     4) 用最佳模型對 X_test 預測
-    5) 視覺化：畫一棵「淺樹」與輸出文字規則
-    返回: (y_pred_test, best_model)
+    5) return y_pred_test
     """
 
-    # -----------------------------
-    # A. 準備資料（去掉 ID 欄位）
-    # -----------------------------
+    # 準備資料，需去掉 ID 欄位
     feat_cols = [c for c in X_train.columns if c != "acct"]
     X_tr = X_train[feat_cols].copy()
     X_te = X_test[feat_cols].copy()
@@ -94,9 +91,7 @@ def Modeling(X_train: pd.DataFrame, y_train: pd.Series, X_test: pd.DataFrame
         X_tr, y_train, test_size=0.2, random_state=42, stratify=y_train
     )
 
-    # -----------------------------
-    # B. GridSearchCV（以 F1 為指標）
-    # -----------------------------
+    # GridSearchCV（以 F1 為指標）
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     param_grid = {
         "max_depth": [3, 4, 5, 6, 8, None],
@@ -117,7 +112,7 @@ def Modeling(X_train: pd.DataFrame, y_train: pd.Series, X_test: pd.DataFrame
     grid.fit(X_tr_in, y_tr_in)
 
     best_model: DecisionTreeClassifier = grid.best_estimator_
-    # 用 validation 看真實 F1（不是 CV 的平均）
+    # 用 validation 看真實 F1
     y_val_pred = best_model.predict(X_val)
     val_f1 = f1_score(y_val, y_val_pred)
 
@@ -125,9 +120,7 @@ def Modeling(X_train: pd.DataFrame, y_train: pd.Series, X_test: pd.DataFrame
     print("[GridSearch] Best params:", grid.best_params_)
     print("[Holdout]   Validation F1:", val_f1)
 
-    # -----------------------------
-    # C. 用最佳模型對 X_test 預測
-    # -----------------------------
+    # 用最佳模型對 X_test 預測
     y_pred_test = best_model.predict(X_te)
 
     print("(Finish) Modeling with GridSearchCV + F1 evaluation + Visualization")

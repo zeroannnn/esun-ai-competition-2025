@@ -12,18 +12,6 @@ def total_send_recv_amt(df: pd.DataFrame) -> pd.DataFrame:
     print(f"(Finish) func: total_send_recv_amt")
     return out
 
-# 標記使用大於一種 currency 的轉入轉出戶
-def is_multi_curr_acount(df):
-    from_multi = df.groupby('from_acct')['currency_type'].nunique().rename('send_currency_count')
-    to_multi   = df.groupby('to_acct')['currency_type'].nunique().rename('recv_currency_count')
-
-    multi_flag = pd.concat([from_multi, to_multi], axis=1).fillna(0).astype(int)
-    multi_flag['multi_currency_flag'] = ((multi_flag['send_currency_count'] > 1) | 
-                                         (multi_flag['recv_currency_count'] > 1)).astype(int)
-    multi_flag = multi_flag.reset_index().rename(columns={'index': 'acct'})
-    print(f"(Finish) func: is_multi_curr_acount")
-    return multi_flag
-
 # 每一個帳戶轉出/轉入的最大、最小、平均價格
 def calculate_max_min_avg(df: pd.DataFrame) -> pd.DataFrame:
     # 2. max, min, avg txn_amt for each account
@@ -93,7 +81,7 @@ def transform_txn_time(df):
     df['txn_hour'] = pd.to_datetime(df['txn_time'], format='%H:%M:%S').dt.hour
 
     # 根據銀行活動時間定義區間
-    bins = [0, 6, 9, 12, 14, 17, 21, 24]
+    bins = [0, 6, 9, 12, 14, 18, 21, 24]
     labels = ['LateNight', 'EarlyMorning', 'MorningWork', 'LunchBreak',
             'AfternoonWork', 'EveningTrade', 'NightTrade']
 
@@ -127,14 +115,26 @@ def transform_txn_time(df):
                    .rename(columns={'from_acct':'acct'}))
 
     # 深夜交易占比（00-06），單獨列出來針對決策有比較大的影響力
-    night_ratio = (by_acct_cnt[['acct','cnt_LateNight']]
+    deep_night_ratio = (by_acct_cnt[['acct','cnt_LateNight']]
                    .assign(total=total_cnt)
                    .eval('night_ratio = cnt_LateNight / total')[['acct','night_ratio']])
+    
+    # 每個帳號於 18-24 進行交易的的佔比
+    evening_cols = ['cnt_AfternoonWork', 'cnt_EveningTrade', 'cnt_NightTrade']
+    for c in evening_cols:
+        if c not in by_acct_cnt.columns:
+            by_acct_cnt[c] = 0
+    evening_ratio = (
+        by_acct_cnt[['acct'] + evening_cols]
+        .assign(total=total_cnt)
+        .eval('evening_ratio = (cnt_AfternoonWork + cnt_EveningTrade + cnt_NightTrade) / total')[['acct','evening_ratio']]
+    )
 
     # Merge 表格
     out = by_acct_cnt.merge(ratio, left_index=True, right_index=True)
     out = out.merge(mean_hour, on='acct', how='left')
-    out = out.merge(night_ratio, on='acct', how='left')
+    out = out.merge(deep_night_ratio, on='acct', how='left')
+    out = out.merge(evening_ratio, on='acct', how='left')
 
     # 缺值補 0
     num_cols = out.columns.difference(['acct'])
@@ -143,22 +143,34 @@ def transform_txn_time(df):
     print("(Finish) func: transform_txn_time")
     return out
 
+# 標記使用大於一種 currency 的轉入轉出戶
+def is_multi_curr_acount(df):
+    from_multi = df.groupby('from_acct')['currency_type'].nunique().rename('send_currency_count')
+    to_multi   = df.groupby('to_acct')['currency_type'].nunique().rename('recv_currency_count')
+
+    multi_flag = pd.concat([from_multi, to_multi], axis=1).fillna(0).astype(int)
+    multi_flag['multi_currency_flag'] = ((multi_flag['send_currency_count'] > 1) | 
+                                         (multi_flag['recv_currency_count'] > 1)).astype(int)
+    multi_flag = multi_flag.reset_index().rename(columns={'index': 'acct'})
+    print(f"(Finish) func: is_multi_curr_acount")
+    return multi_flag
+
 FeatureFunc = Callable[[pd.DataFrame], pd.DataFrame]
 FEATURES: Dict[str, FeatureFunc] = {
     "send_recv": total_send_recv_amt,
-    "is_multi_curr_acount": is_multi_curr_acount,
     "agg_stats": calculate_max_min_avg,
     "is_esun": build_is_esun,
     "daily_trading": daily_trading_volume_of_an_account,
     "number_of_payees": number_of_payees,
     "txn_period": transform_txn_time,
+    "is_multi_curr_acount": is_multi_curr_acount,
 }
 
 # 將選定特徵用 acct 為 key 逐一 merge 起來
 def preprocess(df: pd.DataFrame, feature_list: List[str] = None) -> pd.DataFrame:
     if feature_list is None:
-        feature_list = ["send_recv", "is_multi_curr_acount", "agg_stats", "is_esun", "daily_trading", "number_of_payees", "txn_period"]
-
+        feature_list = ["is_esun", "daily_trading", "number_of_payees", "txn_period", "is_multi_curr_acount"]
+    # "send_recv", "agg_stats", 
     # 進去 FEATURES 跑每一個 func
     tables = [FEATURES[name](df) for name in feature_list]
     # 依序 merge
